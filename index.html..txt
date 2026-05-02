@@ -1,0 +1,751 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ── Fonts ──────────────────────────────────────────────────────────────────
+const FontLink = () => (
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+);
+
+// ── Color system ───────────────────────────────────────────────────────────
+const C = {
+  bg: "#070b0f",
+  surface: "#0d1117",
+  border: "#1a2332",
+  borderBright: "#243447",
+  bull: "#00d4a0",
+  bear: "#ff4d6d",
+  neutral: "#f5c542",
+  text: "#e8edf3",
+  muted: "#4a5568",
+  accent: "#3d7fff",
+  panel: "#0a1018",
+};
+
+// ── Ticker presets ─────────────────────────────────────────────────────────
+const MARKETS = {
+  "USA": ["AAPL","MSFT","TSLA","NVDA","GOOGL","AMZN","META","SPY","QQQ","AMD"],
+  "Crypto": ["BTC","ETH","SOL","BNB","ADA","XRP","DOGE","AVAX","MATIC","DOT"],
+  "Forex": ["EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD","NZD/USD","EUR/GBP"],
+  "LATAM": ["VALE","ITUB","BBD","PBR","BSMX","CPAC","GGB","SID","CIB","EC"],
+};
+
+// ── Candle pattern definitions ─────────────────────────────────────────────
+const PATTERNS = {
+  doji: { name: "Doji", emoji: "⚖️", bias: "neutral", desc: "Apertura ≈ Cierre. Indecisión del mercado." },
+  hammer: { name: "Martillo", emoji: "🔨", bias: "bullish", desc: "Mecha larga inferior. Reversión alcista." },
+  shootingStar: { name: "Estrella Fugaz", emoji: "💫", bias: "bearish", desc: "Mecha larga superior. Reversión bajista." },
+  engulfingBull: { name: "Envolvente Alcista", emoji: "🟢", bias: "bullish", desc: "Vela verde envuelve la roja anterior." },
+  engulfingBear: { name: "Envolvente Bajista", emoji: "🔴", bias: "bearish", desc: "Vela roja envuelve la verde anterior." },
+  morningStar: { name: "Estrella de la Mañana", emoji: "🌅", bias: "bullish", desc: "Patrón de 3 velas. Fuerte reversión alcista." },
+  eveningStar: { name: "Estrella Vespertina", emoji: "🌆", bias: "bearish", desc: "Patrón de 3 velas. Fuerte reversión bajista." },
+  marubozu: { name: "Marubozu", emoji: "📊", bias: "trend", desc: "Sin mechas. Dominio total del comprador/vendedor." },
+  spinningTop: { name: "Peón", emoji: "🌀", bias: "neutral", desc: "Cuerpo pequeño. Alta incertidumbre." },
+};
+
+// ── Candle generator (realistic OHLC simulation) ──────────────────────────
+function generateCandles(seed, count = 80, basePrice = 150, volatility = 0.022) {
+  let price = basePrice;
+  let trend = 0;
+  const candles = [];
+  let rng = seed;
+  const rand = () => { rng = (rng * 16807 + 0) % 2147483647; return (rng - 1) / 2147483646; };
+
+  for (let i = 0; i < count; i++) {
+    trend += (rand() - 0.5) * 0.3;
+    trend = Math.max(-1, Math.min(1, trend));
+    const move = (trend * 0.4 + (rand() - 0.5)) * volatility;
+    const open = price;
+    const close = price * (1 + move);
+    const high = Math.max(open, close) * (1 + rand() * volatility * 0.8);
+    const low = Math.min(open, close) * (1 - rand() * volatility * 0.8);
+    const vol = Math.floor(rand() * 5000000 + 500000);
+    candles.push({ open, high, low, close, vol, i });
+    price = close;
+  }
+  return candles;
+}
+
+// ── Pattern detector ──────────────────────────────────────────────────────
+function detectPattern(candles, idx) {
+  if (idx < 2 || idx >= candles.length) return null;
+  const c = candles[idx];
+  const p = candles[idx - 1];
+  const pp = candles[idx - 2];
+
+  const body = Math.abs(c.close - c.open);
+  const range = c.high - c.low;
+  const upperWick = c.high - Math.max(c.open, c.close);
+  const lowerWick = Math.min(c.open, c.close) - c.low;
+
+  if (body / range < 0.08) return PATTERNS.doji;
+  if (body / range < 0.25) return PATTERNS.spinningTop;
+  if (c.close > c.open && lowerWick > body * 2 && upperWick < body * 0.5) return PATTERNS.hammer;
+  if (c.close < c.open && upperWick > body * 2 && lowerWick < body * 0.5) return PATTERNS.shootingStar;
+  if (body / range > 0.92) return PATTERNS.marubozu;
+
+  const pBody = Math.abs(p.close - p.open);
+  if (c.close > c.open && p.close < p.open && c.open < p.close && c.close > p.open && body > pBody) return PATTERNS.engulfingBull;
+  if (c.close < c.open && p.close > p.open && c.open > p.close && c.close < p.open && body > pBody) return PATTERNS.engulfingBear;
+
+  const ppBull = pp.close > pp.open;
+  const pSmall = Math.abs(p.close - p.open) < Math.abs(pp.close - pp.open) * 0.4;
+  if (ppBull && pSmall && c.close > c.open && c.close > (pp.open + pp.close) / 2) return PATTERNS.morningStar;
+  if (!ppBull && pSmall && c.close < c.open && c.close < (pp.open + pp.close) / 2) return PATTERNS.eveningStar;
+
+  return null;
+}
+
+// ── Market sentiment (technical analysis) ────────────────────────────────
+function analyzeSentiment(candles) {
+  if (candles.length < 20) return { score: 50, label: "Neutral", trend: "sideways" };
+
+  const recent = candles.slice(-20);
+  const last5 = candles.slice(-5);
+
+  // Simple moving averages
+  const sma20 = recent.reduce((s, c) => s + c.close, 0) / 20;
+  const sma5 = last5.reduce((s, c) => s + c.close, 0) / 5;
+  const lastClose = candles[candles.length - 1].close;
+
+  // RSI-like momentum (simplified)
+  let gains = 0, losses = 0;
+  for (let i = 1; i < recent.length; i++) {
+    const d = recent[i].close - recent[i-1].close;
+    if (d > 0) gains += d; else losses -= d;
+  }
+  const rs = gains / (losses || 1);
+  const rsi = 100 - 100 / (1 + rs);
+
+  // Bullish candle ratio
+  const bullRatio = last5.filter(c => c.close > c.open).length / 5;
+
+  // Pattern bias
+  let patternScore = 0;
+  for (let i = 2; i < candles.length; i++) {
+    const p = detectPattern(candles, i);
+    if (p) patternScore += p.bias === "bullish" ? 1 : p.bias === "bearish" ? -1 : 0;
+  }
+  patternScore = Math.max(-5, Math.min(5, patternScore));
+
+  // Composite score 0-100
+  let score = 50;
+  score += (sma5 > sma20 ? 1 : -1) * 12;
+  score += (lastClose > sma20 ? 1 : -1) * 10;
+  score += (rsi - 50) * 0.4;
+  score += (bullRatio - 0.5) * 20;
+  score += patternScore * 3;
+  score = Math.max(5, Math.min(95, score));
+
+  const label = score > 65 ? "Alcista" : score < 35 ? "Bajista" : "Lateral";
+  const trend = score > 65 ? "bullish" : score < 35 ? "bearish" : "sideways";
+
+  return { score: Math.round(score), label, trend, rsi: Math.round(rsi), sma5: sma5.toFixed(2), sma20: sma20.toFixed(2) };
+}
+
+// ── AI Analysis via Claude API ────────────────────────────────────────────
+async function fetchAIAnalysis(ticker, candles, sentiment) {
+  const last = candles[candles.length - 1];
+  const prev = candles[candles.length - 2];
+  const change = ((last.close - prev.close) / prev.close * 100).toFixed(2);
+  const patterns = [];
+  for (let i = Math.max(2, candles.length - 10); i < candles.length; i++) {
+    const p = detectPattern(candles, i);
+    if (p && !patterns.find(x => x.name === p.name)) patterns.push(p);
+  }
+
+  const prompt = `Eres un analista técnico experto. Analiza brevemente este activo:
+
+Ticker: ${ticker}
+Precio actual: $${last.close.toFixed(2)}
+Cambio: ${change}%
+RSI (14): ${sentiment.rsi}
+SMA5: $${sentiment.sma5} | SMA20: $${sentiment.sma20}
+Sentimiento técnico: ${sentiment.label} (score: ${sentiment.score}/100)
+Patrones detectados: ${patterns.map(p => p.name).join(", ") || "ninguno reciente"}
+
+Responde en español con:
+1. *Diagnóstico* (2 líneas máx): posición actual del mercado
+2. *Patrones clave*: qué implican los patrones detectados
+3. *Niveles*: soporte estimado y resistencia estimada
+4. *Señal*: COMPRAR / VENDER / ESPERAR con justificación de 1 línea
+
+Sé conciso y directo. Usa emojis moderadamente.`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text || "No se pudo obtener análisis.";
+}
+
+// ── Candlestick Chart Component ───────────────────────────────────────────
+function CandleChart({ candles, width = 700, height = 320 }) {
+  const svgRef = useRef(null);
+  const [tooltip, setTooltip] = useState(null);
+
+  const visible = candles.slice(-60);
+  const padding = { top: 20, right: 10, bottom: 30, left: 60 };
+  const chartW = width - padding.left - padding.right;
+  const chartH = height - padding.top - padding.bottom;
+
+  const allPrices = visible.flatMap(c => [c.high, c.low]);
+  const minP = Math.min(...allPrices) * 0.999;
+  const maxP = Math.max(...allPrices) * 1.001;
+  const priceRange = maxP - minP;
+
+  const xScale = (i) => (i / (visible.length - 1)) * chartW;
+  const yScale = (p) => chartH - ((p - minP) / priceRange) * chartH;
+
+  const candleW = Math.max(3, (chartW / visible.length) * 0.7);
+
+  // Grid lines
+  const gridCount = 5;
+  const gridPrices = Array.from({ length: gridCount }, (_, i) =>
+    minP + (priceRange * i) / (gridCount - 1)
+  );
+
+  return (
+    <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
+      <svg
+        ref={svgRef}
+        viewBox={0 0 ${width} ${height}}
+        style={{ width: "100%", height: "auto", display: "block" }}
+      >
+        <defs>
+          <linearGradient id="bullGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={C.bull} stopOpacity="0.15" />
+            <stop offset="100%" stopColor={C.bull} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+
+        <g transform={translate(${padding.left},${padding.top})}>
+          {/* Grid */}
+          {gridPrices.map((p, i) => (
+            <g key={i}>
+              <line x1={0} y1={yScale(p)} x2={chartW} y2={yScale(p)}
+                stroke={C.border} strokeWidth="1" strokeDasharray="3,5" />
+              <text x={-6} y={yScale(p) + 4} textAnchor="end"
+                fill={C.muted} fontSize="10" fontFamily="Space Mono, monospace">
+                {p.toFixed(0)}
+              </text>
+            </g>
+          ))}
+
+          {/* Candles */}
+          {visible.map((c, i) => {
+            const x = xScale(i);
+            const isBull = c.close >= c.open;
+            const color = isBull ? C.bull : C.bear;
+            const bodyTop = yScale(Math.max(c.open, c.close));
+            const bodyBot = yScale(Math.min(c.open, c.close));
+            const bodyH = Math.max(1, bodyBot - bodyTop);
+            const pattern = detectPattern(candles, candles.length - visible.length + i);
+
+            return (
+              <g key={i}
+                onMouseEnter={(e) => setTooltip({ candle: c, x: e.clientX, y: e.clientY, pattern })}
+                onMouseLeave={() => setTooltip(null)}
+                style={{ cursor: "crosshair" }}
+              >
+                {/* Wick */}
+                <line x1={x} y1={yScale(c.high)} x2={x} y2={yScale(c.low)}
+                  stroke={color} strokeWidth="1" opacity="0.8" />
+                {/* Body */}
+                <rect
+                  x={x - candleW / 2}
+                  y={bodyTop}
+                  width={candleW}
+                  height={bodyH}
+                  fill={isBull ? color : color}
+                  opacity={isBull ? 0.9 : 0.85}
+                  rx="1"
+                />
+                {/* Pattern marker */}
+                {pattern && (
+                  <circle cx={x} cy={yScale(c.high) - 8} r="3"
+                    fill={pattern.bias === "bullish" ? C.bull : pattern.bias === "bearish" ? C.bear : C.neutral}
+                    opacity="0.9" />
+                )}
+              </g>
+            );
+          })}
+
+          {/* Volume bars at bottom */}
+          {visible.map((c, i) => {
+            const x = xScale(i);
+            const maxVol = Math.max(...visible.map(v => v.vol));
+            const volH = (c.vol / maxVol) * 30;
+            return (
+              <rect key={v${i}}
+                x={x - candleW / 2}
+                y={chartH - volH}
+                width={candleW}
+                height={volH}
+                fill={c.close >= c.open ? C.bull : C.bear}
+                opacity="0.2"
+              />
+            );
+          })}
+        </g>
+      </svg>
+
+      {/* Tooltip */}
+      {tooltip && (
+        <div style={{
+          position: "fixed",
+          left: tooltip.x + 12,
+          top: tooltip.y - 80,
+          background: "#0d1117ee",
+          border: 1px solid ${C.border},
+          borderRadius: 8,
+          padding: "8px 12px",
+          fontSize: 11,
+          fontFamily: "Space Mono, monospace",
+          color: C.text,
+          pointerEvents: "none",
+          zIndex: 100,
+          backdropFilter: "blur(8px)",
+          minWidth: 140,
+        }}>
+          <div style={{ color: C.muted, marginBottom: 4 }}>OHLCV</div>
+          <div>O: <span style={{ color: C.text }}>{tooltip.candle.open.toFixed(2)}</span></div>
+          <div>H: <span style={{ color: C.bull }}>{tooltip.candle.high.toFixed(2)}</span></div>
+          <div>L: <span style={{ color: C.bear }}>{tooltip.candle.low.toFixed(2)}</span></div>
+          <div>C: <span style={{ color: tooltip.candle.close >= tooltip.candle.open ? C.bull : C.bear }}>
+            {tooltip.candle.close.toFixed(2)}
+          </span></div>
+          {tooltip.pattern && (
+            <div style={{ marginTop: 4, color: C.neutral }}>{tooltip.pattern.emoji} {tooltip.pattern.name}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sentiment Gauge ───────────────────────────────────────────────────────
+function SentimentGauge({ score, label, trend }) {
+  const angle = (score / 100) * 180 - 90;
+  const color = trend === "bullish" ? C.bull : trend === "bearish" ? C.bear : C.neutral;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <svg viewBox="0 0 120 70" style={{ width: 140, height: 82 }}>
+        {/* Arc bg */}
+        <path d="M 10 60 A 50 50 0 0 1 110 60" fill="none" stroke={C.border} strokeWidth="10" strokeLinecap="round" />
+        {/* Bear arc */}
+        <path d="M 10 60 A 50 50 0 0 1 60 10" fill="none" stroke={C.bear} strokeWidth="10" strokeLinecap="round" opacity="0.4" />
+        {/* Bull arc */}
+        <path d="M 60 10 A 50 50 0 0 1 110 60" fill="none" stroke={C.bull} strokeWidth="10" strokeLinecap="round" opacity="0.4" />
+        {/* Needle */}
+        <line
+          x1="60" y1="60"
+          x2={60 + 38 * Math.cos((angle - 90) * Math.PI / 180)}
+          y2={60 + 38 * Math.sin((angle - 90) * Math.PI / 180)}
+          stroke={color} strokeWidth="2.5" strokeLinecap="round"
+        />
+        <circle cx="60" cy="60" r="5" fill={color} />
+        <text x="60" y="52" textAnchor="middle" fill={color} fontSize="11" fontFamily="Syne, sans-serif" fontWeight="700">
+          {score}
+        </text>
+      </svg>
+      <div style={{
+        fontSize: 16, fontWeight: 700, color,
+        fontFamily: "Syne, sans-serif", letterSpacing: 1, marginTop: -8
+      }}>{label}</div>
+    </div>
+  );
+}
+
+// ── Pattern Card ──────────────────────────────────────────────────────────
+function PatternCard({ pattern, count }) {
+  const color = pattern.bias === "bullish" ? C.bull : pattern.bias === "bearish" ? C.bear : C.neutral;
+  return (
+    <div style={{
+      background: color + "12",
+      border: 1px solid ${color}33,
+      borderRadius: 10,
+      padding: "10px 14px",
+      display: "flex",
+      alignItems: "center",
+      gap: 10,
+    }}>
+      <span style={{ fontSize: 20 }}>{pattern.emoji}</span>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color, fontFamily: "Syne, sans-serif" }}>{pattern.name}</div>
+        <div style={{ fontSize: 10, color: C.muted, marginTop: 1 }}>{pattern.desc}</div>
+      </div>
+      {count > 1 && (
+        <div style={{ fontSize: 10, color: C.muted, background: C.border, borderRadius: 99, padding: "2px 7px" }}>×{count}</div>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
+export default function App() {
+  const [activeMarket, setActiveMarket] = useState("USA");
+  const [ticker, setTicker] = useState("AAPL");
+  const [searchVal, setSearchVal] = useState("");
+  const [timeframe, setTimeframe] = useState("1D");
+  const [candles, setCandles] = useState([]);
+  const [sentiment, setSentiment] = useState(null);
+  const [detectedPatterns, setDetectedPatterns] = useState([]);
+  const [aiAnalysis, setAiAnalysis] = useState("");
+  const [loadingAI, setLoadingAI] = useState(false);
+  const [watchlist, setWatchlist] = useState(["AAPL", "BTC", "EUR/USD"]);
+
+  const TF_SEEDS = { "5M": 11, "15M": 22, "1H": 33, "4H": 44, "1D": 55, "1W": 66 };
+  const TF_VOL = { "5M": 0.008, "15M": 0.012, "1H": 0.016, "4H": 0.020, "1D": 0.025, "1W": 0.04 };
+
+  const loadTicker = useCallback((t, tf = timeframe) => {
+    const seed = t.split("").reduce((a, c) => a + c.charCodeAt(0), 0) * TF_SEEDS[tf];
+    const vol = TF_VOL[tf];
+    const base = t.includes("/") ? 1.08 : t === "BTC" ? 65000 : t === "ETH" ? 3200 : 150;
+    const c = generateCandles(seed, 80, base, vol);
+    setCandles(c);
+    const s = analyzeSentiment(c);
+    setSentiment(s);
+
+    // Detect patterns in last 20 candles
+    const patternMap = {};
+    for (let i = 2; i < c.length; i++) {
+      const p = detectPattern(c, i);
+      if (p) patternMap[p.name] = { pattern: p, count: (patternMap[p.name]?.count || 0) + 1 };
+    }
+    setDetectedPatterns(Object.values(patternMap).sort((a, b) => b.count - a.count).slice(0, 5));
+    setAiAnalysis("");
+  }, [timeframe]);
+
+  useEffect(() => { loadTicker(ticker, timeframe); }, [ticker, timeframe]);
+
+  const runAIAnalysis = async () => {
+    if (!sentiment || loadingAI) return;
+    setLoadingAI(true);
+    try {
+      const result = await fetchAIAnalysis(ticker, candles, sentiment);
+      setAiAnalysis(result);
+    } catch (e) {
+      setAiAnalysis("Error al conectar con el análisis de IA.");
+    } finally {
+      setLoadingAI(false);
+    }
+  };
+
+  const lastCandle = candles[candles.length - 1];
+  const prevCandle = candles[candles.length - 2];
+  const change = lastCandle && prevCandle ? ((lastCandle.close - prevCandle.close) / prevCandle.close * 100) : 0;
+  const isUp = change >= 0;
+
+  const filteredTickers = MARKETS[activeMarket].filter(t =>
+    t.toLowerCase().includes(searchVal.toLowerCase())
+  );
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: C.bg,
+      color: C.text,
+      fontFamily: "Syne, sans-serif",
+      display: "flex",
+      flexDirection: "column",
+    }}>
+      <FontLink />
+
+      {/* Header */}
+      <div style={{
+        borderBottom: 1px solid ${C.border},
+        padding: "12px 20px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        background: C.surface,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{
+            width: 30, height: 30, borderRadius: 8,
+            background: linear-gradient(135deg, ${C.bull}, ${C.accent}),
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 14,
+          }}>📈</div>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 800, letterSpacing: 0.5 }}>MarketLens</div>
+            <div style={{ fontSize: 9, color: C.muted, letterSpacing: 2, textTransform: "uppercase" }}>Análisis Técnico</div>
+          </div>
+        </div>
+
+        {lastCandle && (
+          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontFamily: "Space Mono, monospace", fontSize: 18, fontWeight: 700 }}>
+                {lastCandle.close.toFixed(2)}
+              </div>
+              <div style={{ fontSize: 11, color: isUp ? C.bull : C.bear, fontFamily: "Space Mono, monospace" }}>
+                {isUp ? "▲" : "▼"} {Math.abs(change).toFixed(2)}%
+              </div>
+            </div>
+            <div style={{
+              background: isUp ? C.bull + "22" : C.bear + "22",
+              border: 1px solid ${isUp ? C.bull : C.bear}44,
+              borderRadius: 8,
+              padding: "6px 14px",
+              fontSize: 16,
+              fontWeight: 800,
+              color: isUp ? C.bull : C.bear,
+              letterSpacing: 1,
+            }}>{ticker}</div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+
+        {/* Sidebar */}
+        <div style={{
+          width: 200,
+          background: C.surface,
+          borderRight: 1px solid ${C.border},
+          display: "flex",
+          flexDirection: "column",
+          flexShrink: 0,
+        }}>
+          {/* Market tabs */}
+          <div style={{ padding: "12px 10px 8px", borderBottom: 1px solid ${C.border} }}>
+            {Object.keys(MARKETS).map(m => (
+              <button key={m} onClick={() => { setActiveMarket(m); setSearchVal(""); }}
+                style={{
+                  display: "block", width: "100%", textAlign: "left",
+                  padding: "6px 10px", borderRadius: 6, border: "none", cursor: "pointer",
+                  background: activeMarket === m ? C.accent + "22" : "transparent",
+                  color: activeMarket === m ? C.accent : C.muted,
+                  fontSize: 12, fontFamily: "Syne, sans-serif", fontWeight: 600,
+                  marginBottom: 2,
+                }}>
+                {m === "USA" ? "🇺🇸 USA" : m === "Crypto" ? "₿ Crypto" : m === "Forex" ? "💱 Forex" : "🌎 LATAM"}
+              </button>
+            ))}
+          </div>
+
+          {/* Search */}
+          <div style={{ padding: "8px 10px", borderBottom: 1px solid ${C.border} }}>
+            <input
+              value={searchVal}
+              onChange={e => setSearchVal(e.target.value)}
+              placeholder="Buscar ticker..."
+              style={{
+                width: "100%", background: C.bg, border: 1px solid ${C.border},
+                borderRadius: 6, padding: "6px 10px", color: C.text,
+                fontSize: 11, fontFamily: "Space Mono, monospace", outline: "none",
+                boxSizing: "border-box",
+              }}
+            />
+          </div>
+
+          {/* Ticker list */}
+          <div style={{ flex: 1, overflowY: "auto", padding: "6px 8px" }}>
+            {filteredTickers.map(t => (
+              <button key={t} onClick={() => setTicker(t)}
+                style={{
+                  display: "block", width: "100%", textAlign: "left",
+                  padding: "7px 10px", borderRadius: 6, border: "none", cursor: "pointer",
+                  background: ticker === t ? C.accent + "22" : "transparent",
+                  color: ticker === t ? C.text : C.muted,
+                  fontSize: 12, fontFamily: "Space Mono, monospace",
+                  marginBottom: 1,
+                  borderLeft: ticker === t ? 2px solid ${C.accent} : "2px solid transparent",
+                }}>
+                {t}
+              </button>
+            ))}
+          </div>
+
+          {/* Watchlist */}
+          <div style={{ borderTop: 1px solid ${C.border}, padding: "10px 10px" }}>
+            <div style={{ fontSize: 9, color: C.muted, letterSpacing: 2, marginBottom: 6, textTransform: "uppercase" }}>Watchlist</div>
+            {watchlist.map(t => (
+              <div key={t} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
+                <button onClick={() => setTicker(t)}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: C.accent, fontSize: 11, fontFamily: "Space Mono, monospace", padding: 0 }}>
+                  {t}
+                </button>
+                <button onClick={() => setWatchlist(w => w.filter(x => x !== t))}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: C.muted, fontSize: 12, padding: "0 2px" }}>×</button>
+              </div>
+            ))}
+            {!watchlist.includes(ticker) && (
+              <button onClick={() => setWatchlist(w => [...w, ticker])}
+                style={{
+                  marginTop: 4, width: "100%", padding: "4px", border: 1px dashed ${C.border},
+                  borderRadius: 5, background: "none", color: C.muted, fontSize: 10,
+                  cursor: "pointer", fontFamily: "Syne, sans-serif",
+                }}>+ Agregar {ticker}</button>
+            )}
+          </div>
+        </div>
+
+        {/* Main content */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
+          {/* Timeframe bar */}
+          <div style={{
+            padding: "8px 16px",
+            borderBottom: 1px solid ${C.border},
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: C.panel,
+          }}>
+            {["5M","15M","1H","4H","1D","1W"].map(tf => (
+              <button key={tf} onClick={() => setTimeframe(tf)}
+                style={{
+                  padding: "4px 12px", borderRadius: 5, border: "none", cursor: "pointer",
+                  background: timeframe === tf ? C.accent : "transparent",
+                  color: timeframe === tf ? "#fff" : C.muted,
+                  fontSize: 11, fontFamily: "Space Mono, monospace", fontWeight: 700,
+                }}>
+                {tf}
+              </button>
+            ))}
+            <div style={{ flex: 1 }} />
+            <div style={{ fontSize: 10, color: C.muted, fontFamily: "Space Mono, monospace" }}>
+              Vol: {lastCandle ? (lastCandle.vol / 1e6).toFixed(2) + "M" : "—"}
+            </div>
+          </div>
+
+          {/* Chart + Info row */}
+          <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+
+            {/* Chart */}
+            <div style={{ flex: 1, padding: "16px 16px 0", overflow: "hidden", minWidth: 0 }}>
+              <CandleChart candles={candles} width={680} height={300} />
+
+              {/* Pattern legend */}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8, paddingBottom: 8 }}>
+                <div style={{ fontSize: 9, color: C.muted, display: "flex", alignItems: "center", gap: 3 }}>
+                  <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.bull }} />alcista
+                </div>
+                <div style={{ fontSize: 9, color: C.muted, display: "flex", alignItems: "center", gap: 3 }}>
+                  <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.bear }} />bajista
+                </div>
+                <div style={{ fontSize: 9, color: C.muted, display: "flex", alignItems: "center", gap: 3 }}>
+                  <div style={{ width: 6, height: 6, borderRadius: "50%", background: C.neutral }} />neutral
+                </div>
+                <span style={{ fontSize: 9, color: C.muted }}>• Los puntos sobre las velas indican patrones detectados</span>
+              </div>
+            </div>
+
+            {/* Right panel */}
+            <div style={{
+              width: 220,
+              background: C.surface,
+              borderLeft: 1px solid ${C.border},
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}>
+              {/* Sentiment */}
+              {sentiment && (
+                <div style={{ padding: "16px 12px", borderBottom: 1px solid ${C.border}, textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: C.muted, letterSpacing: 2, marginBottom: 8, textTransform: "uppercase" }}>Sentimiento</div>
+                  <SentimentGauge score={sentiment.score} label={sentiment.label} trend={sentiment.trend} />
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 10 }}>
+                    {[
+                      { label: "RSI", value: sentiment.rsi, color: sentiment.rsi > 70 ? C.bear : sentiment.rsi < 30 ? C.bull : C.text },
+                      { label: "Score", value: sentiment.score + "/100", color: C.text },
+                      { label: "SMA5", value: "$" + sentiment.sma5, color: C.accent },
+                      { label: "SMA20", value: "$" + sentiment.sma20, color: C.muted },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} style={{
+                        background: C.bg, borderRadius: 6, padding: "6px 8px",
+                      }}>
+                        <div style={{ fontSize: 8, color: C.muted, letterSpacing: 1, textTransform: "uppercase" }}>{label}</div>
+                        <div style={{ fontSize: 12, fontFamily: "Space Mono, monospace", color, marginTop: 1 }}>{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Patterns */}
+              <div style={{ flex: 1, overflow: "auto", padding: "10px 10px" }}>
+                <div style={{ fontSize: 9, color: C.muted, letterSpacing: 2, marginBottom: 8, textTransform: "uppercase" }}>Patrones Detectados</div>
+                {detectedPatterns.length === 0 && (
+                  <div style={{ fontSize: 11, color: C.muted, textAlign: "center", marginTop: 20 }}>Sin patrones claros</div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {detectedPatterns.map(({ pattern, count }) => (
+                    <PatternCard key={pattern.name} pattern={pattern} count={count} />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* AI Analysis panel */}
+          <div style={{
+            borderTop: 1px solid ${C.border},
+            background: C.surface,
+            padding: "12px 16px",
+            minHeight: 100,
+            maxHeight: 200,
+            overflow: "auto",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <div style={{ fontSize: 9, color: C.muted, letterSpacing: 2, textTransform: "uppercase" }}>
+                🤖 Análisis IA — {ticker} ({timeframe})
+              </div>
+              <button
+                onClick={runAIAnalysis}
+                disabled={loadingAI}
+                style={{
+                  padding: "5px 14px",
+                  background: loadingAI ? C.border : linear-gradient(135deg, ${C.accent}, #6b21ff),
+                  border: "none", borderRadius: 99, color: "#fff",
+                  fontSize: 11, fontFamily: "Syne, sans-serif", fontWeight: 700,
+                  cursor: loadingAI ? "not-allowed" : "pointer",
+                  opacity: loadingAI ? 0.6 : 1,
+                  transition: "all 0.2s",
+                }}>
+                {loadingAI ? "Analizando..." : "Analizar con IA"}
+              </button>
+            </div>
+
+            {!aiAnalysis && !loadingAI && (
+              <div style={{ fontSize: 12, color: C.muted, fontStyle: "italic" }}>
+                Presiona "Analizar con IA" para obtener un diagnóstico técnico completo de {ticker}.
+              </div>
+            )}
+
+            {loadingAI && (
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                {[0,1,2].map(i => (
+                  <div key={i} style={{
+                    width: 6, height: 6, borderRadius: "50%",
+                    background: C.accent,
+                    animation: pulse 1s ease-in-out ${i * 0.2}s infinite,
+                  }} />
+                ))}
+                <style>{@keyframes pulse { 0%,100%{opacity:0.2;transform:scale(1)} 50%{opacity:1;transform:scale(1.3)} }}</style>
+                <span style={{ fontSize: 12, color: C.muted }}>Claude está analizando el gráfico...</span>
+              </div>
+            )}
+
+            {aiAnalysis && (
+              <div style={{
+                fontSize: 12, color: C.text, lineHeight: 1.6,
+                whiteSpace: "pre-wrap", fontFamily: "Syne, sans-serif",
+              }}>
+                {aiAnalysis}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
